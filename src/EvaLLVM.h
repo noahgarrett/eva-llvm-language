@@ -8,6 +8,7 @@
 #include <string>
 #include <regex>
 #include <memory>
+#include <map>
 
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
@@ -15,6 +16,7 @@
 #include "llvm/IR/Verifier.h"
 
 #include "./parser/EvaParser.h"
+#include "Logger.h"
 #include "Environment.h"
 
 using syntax::EvaParser;
@@ -24,12 +26,31 @@ using syntax::EvaParser;
 */
 using Env = std::shared_ptr<Environment>;
 
+/**
+ * Class Info. Contains struct type and field names
+*/
+struct ClassInfo {
+    llvm::StructType* cls;
+    llvm::StructType* parent;
+    std::map<std::string, llvm::Type*> fieldsMap;
+    std::map<std::string, llvm::Function*> methodsMap;
+};
+
+// Generic Binary Operator
+#define GEN_BINARY_OP(Op, varName)         \
+  do {                                     \
+    auto op1 = gen(expr.list[1], env);      \
+    auto op2 = gen(expr.list[2], env);      \
+    return builder->Op(op1, op2, varName); \
+  } while (false);
+
 class EvaLLVM {
     public:
         EvaLLVM() : parser(std::make_unique<EvaParser>()) { 
             moduleInit(); 
             setupExternalFunctions();
             setupGlobalEnvironment();
+            setupTargetTriple();
         }
     
     void exec(const std::string& program) {
@@ -104,8 +125,13 @@ class EvaLLVM {
                         }
 
                         // 2. Global Variables
-                        if (auto globalVar = llvm::dyn_cast<llvm::GlobalVariable>(value)) {
+                        else if (auto globalVar = llvm::dyn_cast<llvm::GlobalVariable>(value)) {
                             return builder->CreateLoad(globalVar->getInitializer()->getType(), globalVar, varName.c_str());
+                        }
+
+                        // 3. Functions
+                        else {
+                            return value;
                         }
                     }
                 }
@@ -118,12 +144,140 @@ class EvaLLVM {
                     if (tag.type == ExpType::SYMBOL) {
                         auto op = tag.string;
 
+                        // Binary Math Operations:
+                        if (op == "+") {
+                            GEN_BINARY_OP(CreateAdd, "tmpadd");
+                        }
+                        else if (op == "-") {
+                            GEN_BINARY_OP(CreateSub, "tmpsub")
+                        }
+                        else if (op == "*") {
+                            GEN_BINARY_OP(CreateMul, "tmpmul");
+                        }
+                        else if (op == "/") {
+                            GEN_BINARY_OP(CreateSDiv, "tmpdiv");
+                        }
+
+                        // Comparison Operations (> 5 10):
+                        else if (op == ">") {
+                            GEN_BINARY_OP(CreateICmpUGT, "tmpcmp");
+                        }
+                        else if (op == "<") {
+                            GEN_BINARY_OP(CreateICmpULT, "tmpcmp");
+                        }
+                        else if (op == "==") {
+                            GEN_BINARY_OP(CreateICmpEQ, "tmpcmp");
+                        }
+                        else if (op == "!=") {
+                            GEN_BINARY_OP(CreateICmpNE, "tmpcmp");
+                        }
+                        else if (op == ">=") {
+                            GEN_BINARY_OP(CreateICmpUGE, "tmpcmp");
+                        }
+                        else if (op == "<=") {
+                            GEN_BINARY_OP(CreateICmpULE, "tmpcmp");
+                        }
+
+                        // Branch Instructions:
+                        /**
+                         * (if <cond> <then> <else>)
+                        */
+                        else if (op == "if") {
+                            // Compile <cond>
+                            auto cond = gen(expr.list[1], env);
+
+                            // Branch Blocks:
+
+                            // Then-block appeneded right away
+                            auto thenBlock = createBasicBlock("then", fn);
+
+                            // Else-IfEnd blocks are appended later to handle nested if-expressions
+                            auto elseBlock = createBasicBlock("else");
+                            auto ifEndBlock = createBasicBlock("ifend");
+
+                            // Condition Branch:
+                            builder->CreateCondBr(cond, thenBlock, elseBlock);
+
+                            // Then branch:
+                            builder->SetInsertPoint(thenBlock);
+                            auto thenRes = gen(expr.list[2], env);
+                            builder->CreateBr(ifEndBlock);
+
+                            // Result the block to handle nested if-expressions. This is needed for the `phi` instruction
+                            thenBlock = builder->GetInsertBlock();
+
+                            // Else branch:
+                            // Append the block to the function now:
+                            fn->getBasicBlockList().push_back(elseBlock);
+                            builder->SetInsertPoint(elseBlock);
+                            auto elseRes = gen(expr.list[3], env);
+                            builder->CreateBr(ifEndBlock);
+                            
+                            elseBlock = builder->GetInsertBlock();
+
+                            // Once the two blocks have finished, Head to the ending block
+                            fn->getBasicBlockList().push_back(ifEndBlock);
+                            builder->SetInsertPoint(ifEndBlock);
+
+                            // Result of the If expression is `phi` instruction
+                            auto phi = builder->CreatePHI(thenRes->getType(), 2, "tmpif");
+
+                            phi->addIncoming(thenRes, thenBlock);
+                            phi->addIncoming(elseRes, elseBlock);
+
+                            return phi;
+                        }
+
+                        // While Loop (while <cond> <body>)
+                        else if (op == "while") {
+                            auto condBlock = createBasicBlock("cond", fn);
+                            builder->CreateBr(condBlock);
+
+                            // Body / While-End blocks
+                            auto bodyBlock = createBasicBlock("body");
+                            auto loopEndBlock = createBasicBlock("loopend");
+
+                            // Compile <cond>
+                            builder->SetInsertPoint(condBlock);
+                            auto cond = gen(expr.list[1], env);
+
+                            // Condition branch
+                            builder->CreateCondBr(cond, bodyBlock, loopEndBlock);
+
+                            // Body
+                            fn->getBasicBlockList().push_back(bodyBlock);
+                            builder->SetInsertPoint(bodyBlock);
+                            gen(expr.list[2], env);
+                            builder->CreateBr(condBlock);
+
+                            fn->getBasicBlockList().push_back(loopEndBlock);
+                            builder->SetInsertPoint(loopEndBlock);
+
+                            return builder->getInt32(0);
+                        }
+
+                        // Function Declaration: (def <name> <params> <body>)
+                        else if (op == "def") {
+                            return compileFunction(expr, /* name */ expr.list[1].string, env);
+                        }
+
                         // Variable declaration: (var x (+ y 10))
                         // Typed: (var (x number) 42)
                         // Note: Locals are allocated on the stack
                         if (op == "var") {
+                            // Special case for class fields, which are already defined during class info allocation:
+                            if (cls != nullptr) {
+                                return builder->getInt32(0);
+                            }
+
                             auto varNameDecl = expr.list[1];
                             auto varName = extractVarName(varNameDecl);
+
+                            // Special case for `new` as it allocates a variable:
+                            if (isNew(expr.list[2])) {
+                                auto instance = createInstance(expr.list[2], env, varName);
+                                return env->define(varName, instance);
+                            }
 
                             // Initializer
                             auto init = gen(expr.list[2], env);
@@ -138,19 +292,41 @@ class EvaLLVM {
                             return builder->CreateStore(init, varBinding);
                         }
 
-                        // Variable update
-                        // (set x 100)
+                        // Variable update: (set x 100)
+                        // Property update: (set (prop self x) 100)
                         else if (op == "set") {
                             // Value:
                             auto value = gen(expr.list[2], env);
+                            
+                            // 1. Properties
 
-                            auto varName = expr.list[1].string;
+                            // Special case for property writes:
+                            if (isProp(expr.list[1])) {
+                                auto instance = gen(expr.list[1].list[1], env);
+                                auto fieldName = expr.list[1].list[2].string;
+                                auto ptrName = std::string("p") + fieldName;
 
-                            // Variable:
-                            auto varBinding = env->lookup(varName);
+                                auto cls = (llvm::StructType*)(instance->getType()->getContainedType(0));
+                                auto fieldIdx = getFieldIndex(cls, fieldName);
+                                auto address = builder->CreateStructGEP(cls, instance, fieldIdx, ptrName);
 
-                            // Set value:
-                            return builder->CreateStore(value, varBinding);
+                                builder->CreateStore(value, address);
+
+                                return value;
+                            }
+
+                            // 2. Variables
+                            else {
+                                auto varName = expr.list[1].string;
+
+                                // Variable:
+                                auto varBinding = env->lookup(varName);
+
+                                // Set value:
+                                builder->CreateStore(value, varBinding);
+
+                                return value;
+                            }
                         }
 
                         // Blocks: (begin <expression>)
@@ -183,11 +359,242 @@ class EvaLLVM {
 
                             return builder->CreateCall(printfFn, args);
                         }
+
+                        // Class Declaration: (class A <super> <body>)
+                        else if (op == "class") {
+                            auto name = expr.list[1].string;
+
+                            auto parent = expr.list[2].string == "null" ? nullptr : getClassByName(expr.list[2].string);
+
+                            // Currently compiling class
+                            cls = llvm::StructType::create(*ctx, name);
+
+                            // Super class data always sits at the first element
+                            if (parent != nullptr) {
+                                inheritClass(cls, parent);
+                            } else {
+                                classMap_[name] = {
+                                    /* class */ cls,
+                                    /* parent */ parent,
+                                    /* fields */ {},
+                                    /* methods */ {}
+                                };
+                            }
+
+                            // Populate the class info with fields and methods
+                            buildClassInfo(cls, expr, env);
+
+                            // Compile the body:
+                            gen(expr.list[3], env);
+
+                            // Reset the class variable after compiling so normal functions do not pick the class name prefix
+                            cls = nullptr;
+
+                            return builder->getInt32(0);
+                        }
+
+                        // `new` Operator: (new <class> <args>)
+                        else if (op == "new") {
+                            return createInstance(expr, env, "");
+                        }
+
+                        // Prop access: (prop <instance> <name>)
+                        else if (op == "prop") {
+                            // Instance
+                            auto instance = gen(expr.list[1], env);
+                            auto fieldName = expr.list[2].string;
+                            auto ptrName = std::string("p") + fieldName;
+
+                            auto cls = (llvm::StructType*)(instance->getType()->getContainedType(0));
+
+                            auto fieldIdx = getFieldIndex(cls, fieldName);
+
+                            auto address = builder->CreateStructGEP(cls, instance, fieldIdx, ptrName);
+
+                            return builder->CreateLoad(cls->getElementType(fieldIdx), address, fieldName);
+                        }
+
+                        // Function calls: (square 2)
+                        else {
+                            auto callable = gen(expr.list[0], env);
+
+                            std::vector<llvm::Value*> args{};
+
+                            for (auto i = 1; i < expr.list.size(); i++) {
+                                args.push_back(gen(expr.list[i], env));
+                            }
+
+                            auto fn = (llvm::Function*)callable;
+
+                            return builder->CreateCall(fn, args);
+                        }
                     }
                 }
             }
 
             return builder->getInt32(0);
+        }
+
+        /**
+         * Returns field index
+        */
+        size_t getFieldIndex(llvm::StructType* cls, const std::string& fieldName) {
+            auto fields = &classMap_[cls->getName().data()].fieldsMap;
+            auto it = fields->find(fieldName);
+
+            return std::distance(fields->begin(), it);
+        }
+
+        /**
+         * Creates an instane of a class
+        */
+        llvm::Value* createInstance(const Exp& exp, Env env, const std::string& name) {
+            auto className = exp.list[1].string;
+            auto cls = getClassByName(className);
+
+            if (cls == nullptr) {
+                DIE << "[EvaLLVM]: Unknown class " << cls;
+            }
+
+            // NOTE: Stack allocation (TODO: Heap allocation)
+            // auto instance = name.empty() ? builder->CreateAlloca(cls) : builder->CreateAlloca(cls, 0, name);
+
+            // We do not use stack allocation for objects, since we need to support constructor (factory) pattern
+            // i.e. return a object from a callee to the caller, outside
+            
+            // Heap Allocation:
+            auto instance = mallocInstance(cls, name);
+
+            // Call constructor
+            auto ctor = module->getFunction(className + "_constructor");
+
+            std::vector<llvm::Value*> args{instance};
+
+            for (auto i = 2; i < exp.list.size(); i++) {
+                args.push_back(gen(exp.list[i], env));
+            }
+
+            builder->CreateCall(ctor, args);
+
+            return instance;
+        }
+
+        /**
+         * Allocates an object of a given class on the heap
+        */
+        llvm::Value* mallocInstance(llvm::StructType* cls, const std::string& name) {
+            auto typeSize = builder->getInt64(getTypeSize(cls));
+
+            // void*
+            auto mallocPtr = builder->CreateCall(module->getFunction("GC_malloc"), typeSize, name);
+
+            // void* -> Class*
+            return builder->CreatePointerCast(mallocPtr, cls->getPointerTo());
+        }
+
+        /**
+         * Returns the size of a type in bytes
+        */
+        size_t getTypeSize(llvm::Type* type_) {
+            return module->getDataLayout().getTypeAllocSize(type_);
+        }
+
+        /**
+         * Inherits parent class fields
+        */
+        void inheritClass(llvm::StructType* cls, llvm::StructType* parent) {
+            // TODO
+        }
+
+        /**
+         * Extracts fields and methods from a class expression
+        */
+        void buildClassInfo(llvm::StructType* cls, const Exp& clsExp, Env env) {
+            auto className = clsExp.list[1].string;
+            auto classInfo = &classMap_[className];
+
+            // Body block: (begin ...)
+            auto body = clsExp.list[3];
+
+            for (auto i = 1; i < body.list.size(); i++) {
+                auto exp = body.list[i];
+
+                // If is variable
+                if (isVar(exp)) {
+                    auto varNameDecl = exp.list[1];
+
+                    auto fieldName = extractVarName(varNameDecl);
+                    auto fieldTy = extractVarType(varNameDecl);
+
+                    classInfo->fieldsMap[fieldName] = fieldTy;
+                }
+
+                // If is function
+                else if (isDef(exp)) {
+                    auto methodName = exp.list[1].string;
+                    auto fnName = className + "_" + methodName;
+
+                    classInfo->methodsMap[methodName] = createFunctionProto(fnName, extractFunctionType(exp), env);
+                }
+            }
+
+            // Create fields:
+            buildClassBody(cls);
+        }
+
+        /**
+         * Builds the class body from class info
+        */
+        void buildClassBody(llvm::StructType* cls) {
+            std::string className{cls->getName().data()};
+
+            auto classInfo = &classMap_[className];
+
+            auto clsFields = std::vector<llvm::Type*>{};
+
+            // Field types:
+            for (const auto& fieldInfo : classInfo->fieldsMap) {
+                clsFields.push_back(fieldInfo.second);
+            }
+
+            cls->setBody(clsFields, /* packed */ false);
+
+            // Methods:
+            // TODO (vTable)
+        }
+
+        /**
+         * Tagged Lists
+        */
+        bool isTaggedList(const Exp& exp, const std::string& tag) {
+            return exp.type == ExpType::LIST && exp.list[0].type == ExpType::SYMBOL && exp.list[0].string == tag;
+        }
+
+        /**
+         * Is: (var ...)
+        */
+        bool isVar(const Exp& exp) { return isTaggedList(exp, "var"); }
+
+        /**
+         * Is: (def ...)
+        */
+        bool isDef(const Exp& exp) { return isTaggedList(exp, "def"); }
+
+        /**
+         * Is: (new ...)
+        */
+        bool isNew(const Exp& exp) { return isTaggedList(exp, "new"); }
+
+        /**
+         * Is: (prop ...)
+        */
+        bool isProp(const Exp& exp) { return isTaggedList(exp, "prop"); }
+
+        /**
+         * Returns a class type by name
+        */
+        llvm::StructType* getClassByName(const std::string& name) {
+            return llvm::StructType::getTypeByName(*ctx, name);
         }
 
         /**
@@ -224,8 +631,95 @@ class EvaLLVM {
                 return builder->getInt8Ty()->getPointerTo();
             }
 
-            // default:
-            return builder->getInt32Ty();
+            // Classes:
+            return classMap_[type_].cls->getPointerTo();
+        }
+
+        /**
+         * Whether the function has a return type defined
+        */
+        bool hasReturnType(const Exp& fnExp) {
+            return fnExp.list[3].type == ExpType::SYMBOL && fnExp.list[3].string == "->";
+        }
+
+        /**
+         * Expr Function to LLVM Function params.
+         * 
+         * (def square ((number x)) -> number ...)
+         * 
+         * llvm::FunctionType::get(returnType, paramTypes, false);
+        */
+        llvm::FunctionType* extractFunctionType(const Exp& fnExp) {
+            auto params = fnExp.list[2];
+
+            // Return type:
+            auto returnType = hasReturnType(fnExp) ? getTypeFromString(fnExp.list[4].string) : builder->getInt32Ty();
+
+            // Parameter Types:
+            std::vector<llvm::Type*> paramTypes{};
+
+            for (auto& param : params.list) {
+                auto paramName = extractVarName(param);
+                auto paramTy = extractVarType(param);
+
+                // The `self` name is special, meaning instance of a class
+                paramTypes.push_back(paramName == "self" ? (llvm::Type*)cls->getPointerTo() : paramTy);
+            }
+
+            return llvm::FunctionType::get(returnType, paramTypes, /* varargs */ false);
+        }
+
+        /**
+         * Compiles a function
+         * 
+         * Untyped: (def square (x) (* x x)) - i32 by default
+         * 
+         * Typed: (def square ((x number)) -> number (* x x))
+        */
+        llvm::Value* compileFunction(const Exp& fnExp, std::string fnName, Env env) {
+            auto params = fnExp.list[2];
+            auto body = hasReturnType(fnExp) ? fnExp.list[5] : fnExp.list[3];
+
+            // Save current fn:
+            auto prevFn = fn;
+            auto prevBlock = builder->GetInsertBlock();
+
+            // TODO: DELETE VAR IF NOT USED
+            auto origFnName = fnName;
+
+            // Class method names:
+            if (cls != nullptr) {
+                fnName = std::string(cls->getName().data()) + "_" + fnName;
+            }
+
+            // Override fn to compile body:
+            auto newFn = createFunction(fnName, extractFunctionType(fnExp), env);
+            fn = newFn;
+
+            // Set parameter names:
+            auto idx = 0;
+
+            // Function environment for params:
+            auto fnEnv = std::make_shared<Environment>(std::map<std::string, llvm::Value*>{}, env);
+
+            for (auto& arg : fn->args()) {
+                auto param = params.list[idx++];
+                auto argName = extractVarName(param);
+
+                arg.setName(argName);
+
+                // Allocate a local variable per argument to make arguments mutable
+                auto argBinding = allocVar(argName, arg.getType(), fnEnv);
+                builder->CreateStore(&arg, argBinding);
+            }
+
+            builder->CreateRet(gen(body, fnEnv));
+
+            // Restore the previous fn after compiling
+            builder->SetInsertPoint(prevBlock);
+            fn = prevFn;
+
+            return newFn;
         }
 
         /**
@@ -269,6 +763,10 @@ class EvaLLVM {
                 /* format arg */ bytePtrTy,
                 /* vararg */ true
             ));
+
+            // void* malloc(size_t size), void* GC_malloc(size_t size)
+            // size_t is i64
+            module->getOrInsertFunction("GC_malloc", llvm::FunctionType::get(bytePtrTy, builder->getInt64Ty(), /* vararg */ false));
         }
 
         /**
@@ -362,6 +860,14 @@ class EvaLLVM {
         }
 
         /**
+         * Sets up target triple.
+        */
+        void setupTargetTriple() {
+            // x86_64-pc-linux-gnu | llvm::sys::getDefaultTargetTriple()
+            module->setTargetTriple("x86_64-pc-linux-gnu");
+        }
+
+        /**
          * Parser
         */
         std::unique_ptr<EvaParser> parser;
@@ -375,6 +881,16 @@ class EvaLLVM {
          * Currently compiling function
         */
         llvm::Function* fn;
+
+        /**
+         * Currently compiling class
+        */
+        llvm::StructType* cls = nullptr;
+
+        /**
+         * Class Info.
+        */
+        std::map<std::string, ClassInfo> classMap_;
 
         std::unique_ptr<llvm::LLVMContext> ctx;
         std::unique_ptr<llvm::Module> module;

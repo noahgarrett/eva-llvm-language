@@ -7,17 +7,28 @@ int main(int argc, char const *argv[])
 {
     // Program to execute
     std::string program = R"(
-        (var x 42)
+        (class Point null
+            (begin
+                
+                (var x 0)
+                (var y 0)
 
-        (begin
-           (var (x string) "Hello")
-           (printf "X: %s\n\n" x))
+                (def constructor (self x y)
+                    (begin
+                        (set (prop self x) x)
+                        (set (prop self y) y)
+                    ))
 
-        (printf "X: %d\n\n" x)
+                (def calc (self)
+                    (+ (prop self x) (prop self y))
+                    )
+                
+                ))
 
-        (set x 100)
+        (var p (new Point 10 20))
 
-        (printf "X: %d\n\n" x)
+        (printf "p.x = %d\n" (prop p x))
+        (printf "p.y = %d\n" (prop p y))
     )";
 
     EvaLLVM vm;
