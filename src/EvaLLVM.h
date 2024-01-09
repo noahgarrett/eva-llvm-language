@@ -36,6 +36,17 @@ struct ClassInfo {
     std::map<std::string, llvm::Function*> methodsMap;
 };
 
+/**
+ * Index of the vTable in the class fields
+*/
+static const size_t VTABLE_INDEX = 0;
+
+/**
+ * Each class has a set of reserved fields at the beginning of its layout.
+ * Currently it's only the vTable used to resolve methods.
+*/
+static const size_t RESERVED_FIELDS_COUNT = 1;
+
 // Generic Binary Operator
 #define GEN_BINARY_OP(Op, varName)         \
   do {                                     \
@@ -414,20 +425,95 @@ class EvaLLVM {
                             return builder->CreateLoad(cls->getElementType(fieldIdx), address, fieldName);
                         }
 
+                        // Method access: (method <instance> <name>) | (method (super <class>) <name>)
+                        else if (op == "method") {
+                            auto methodName = expr.list[2].string;
+
+                            llvm::StructType* cls;
+                            llvm::Value* vTable;
+                            llvm::StructType* vTableTy;
+                            
+                            // 1. Load vTable
+                            // (method (super <class>) <name>)
+                            if (isSuper(expr.list[1])) {
+                                auto className = expr.list[1].list[1].string;
+                                cls = classMap_[className].parent;
+                                auto parentName = std::string{cls->getName().data()};
+                                vTable = module->getNamedGlobal(parentName + "_vTable");
+                                vTableTy = llvm::StructType::getTypeByName(*ctx, parentName + "_vTable");
+                            }
+
+                            // (method <instance> <name>)
+                            else {
+                                auto instance = gen(expr.list[1], env);
+
+                                cls = (llvm::StructType*)(instance->getType()->getContainedType(0));
+
+                                auto vTableAddr = builder->CreateStructGEP(cls, instance, VTABLE_INDEX);
+                                
+                                vTable = builder->CreateLoad(cls->getElementType(VTABLE_INDEX), vTableAddr, "vt");
+
+                                vTableTy = (llvm::StructType*)(vTable->getType()->getContainedType(0));
+                            }
+
+                            // 2. Load method from vTable
+                            auto methodIdx = getMethodIndex(cls, methodName);
+                            auto methodTy = (llvm::FunctionType*)vTableTy->getElementType(methodIdx);
+                            auto methodAddr = builder->CreateStructGEP(vTableTy, vTable, methodIdx);
+
+                            return builder->CreateLoad(methodTy, methodAddr);
+                        }
+
                         // Function calls: (square 2)
                         else {
                             auto callable = gen(expr.list[0], env);
 
+                            auto fn = (llvm::Function*)callable;
+
                             std::vector<llvm::Value*> args{};
 
-                            for (auto i = 1; i < expr.list.size(); i++) {
-                                args.push_back(gen(expr.list[i], env));
-                            }
+                            auto argIdx = 0;
+                            for (auto i = 1; i < expr.list.size(); i++, argIdx++) {
+                                auto argValue = gen(expr.list[i], env);
 
-                            auto fn = (llvm::Function*)callable;
+                                // Need to cast to parameter type to support sub-classes:
+                                // We should be able to pass Point3D instance for the type of the parent class Point
+                                auto paramTy = fn->getArg(argIdx)->getType();
+
+                                auto bitCastArgVal = builder->CreateBitCast(argValue, paramTy);
+                                args.push_back(bitCastArgVal);
+                            }
 
                             return builder->CreateCall(fn, args);
                         }
+                    }
+
+                    // Method Calls: ((method p getX) 2)
+                    else {
+                        auto loadedMethod = (llvm::LoadInst*)gen(expr.list[0], env);
+                        auto fnTy = (llvm::FunctionType*)(loadedMethod->getPointerOperand()
+                                        ->getType()
+                                        ->getContainedType(0)
+                                        ->getContainedType(0));
+                        
+                        std::vector<llvm::Value*> args{};
+
+                        for (auto i = 1; i < expr.list.size(); i++) {
+                            auto argValue = gen(expr.list[i], env);
+
+                            // Need to cast to parameter type to support sub-classes:
+                            // We should be able to pass Point3D instance for the type of the parent class Point
+                            auto paramTy = fnTy->getParamType(i - 1);
+
+                            if (argValue->getType() != paramTy) {
+                                auto bitCastArgVal = builder->CreateBitCast(argValue, paramTy);
+                                args.push_back(bitCastArgVal);
+                            } else {
+                                args.push_back(argValue);
+                            }
+                        }
+
+                        return builder->CreateCall(fnTy, loadedMethod, args);
                     }
                 }
             }
@@ -442,7 +528,17 @@ class EvaLLVM {
             auto fields = &classMap_[cls->getName().data()].fieldsMap;
             auto it = fields->find(fieldName);
 
-            return std::distance(fields->begin(), it);
+            return std::distance(fields->begin(), it) + RESERVED_FIELDS_COUNT;
+        }
+
+        /**
+         * Returns method index
+        */
+        size_t getMethodIndex(llvm::StructType* cls, const std::string& methodName) {
+            auto methods = &classMap_[cls->getName().data()].methodsMap;
+            auto it = methods->find(methodName);
+
+            return std::distance(methods->begin(), it);
         }
 
         /**
@@ -489,7 +585,16 @@ class EvaLLVM {
             auto mallocPtr = builder->CreateCall(module->getFunction("GC_malloc"), typeSize, name);
 
             // void* -> Class*
-            return builder->CreatePointerCast(mallocPtr, cls->getPointerTo());
+            auto instance = builder->CreatePointerCast(mallocPtr, cls->getPointerTo());
+
+            // Install the vTable to lookup methods:
+            std::string className{cls->getName().data()};
+            auto vTableName = className + "_vTable";
+            auto vTableAddr = builder->CreateStructGEP(cls, instance, VTABLE_INDEX);
+            auto vTable = module->getNamedGlobal(vTableName);
+            builder->CreateStore(vTable, vTableAddr);
+
+            return instance;
         }
 
         /**
@@ -503,7 +608,15 @@ class EvaLLVM {
          * Inherits parent class fields
         */
         void inheritClass(llvm::StructType* cls, llvm::StructType* parent) {
-            // TODO
+            auto parentClassInfo = &classMap_[parent->getName().data()];
+
+            // Inherit the field and method names
+            classMap_[cls->getName().data()] = {
+                /* class */ cls,
+                /* parent */ parent,
+                /* fields */ parentClassInfo->fieldsMap,
+                /* methods */ parentClassInfo->methodsMap
+            };
         }
 
         /**
@@ -538,7 +651,7 @@ class EvaLLVM {
                 }
             }
 
-            // Create fields:
+            // Create fields and vTable:
             buildClassBody(cls);
         }
 
@@ -550,7 +663,15 @@ class EvaLLVM {
 
             auto classInfo = &classMap_[className];
 
-            auto clsFields = std::vector<llvm::Type*>{};
+            // Allocate vTable to set its type in the body
+            // The table itself is populated later in buildVTable
+            auto vTableName = className + "_vTable";
+            auto vTableType = llvm::StructType::create(*ctx, vTableName);
+
+            auto clsFields = std::vector<llvm::Type*>{
+                // First element is always the vTable:
+                vTableType->getPointerTo()
+            };
 
             // Field types:
             for (const auto& fieldInfo : classInfo->fieldsMap) {
@@ -560,7 +681,35 @@ class EvaLLVM {
             cls->setBody(clsFields, /* packed */ false);
 
             // Methods:
-            // TODO (vTable)
+            buildVTable(cls);
+        }
+
+        /**
+         * Creates a vTable per class.
+         * 
+         * vTables store method references to support inheritance and methods overloading
+        */
+        void buildVTable(llvm::StructType* cls) {
+            std::string className{cls->getName().data()};
+            auto vTableName = className + "_vTable";
+
+            // The vTable should already exist:
+            auto vTableTy = llvm::StructType::getTypeByName(*ctx, vTableName);
+
+            std::vector<llvm::Constant*> vTableMethods;
+            std::vector<llvm::Type*> vTableMethodTys;
+
+            for (auto& methodInfo : classMap_[className].methodsMap) {
+                auto method = methodInfo.second;
+                
+                vTableMethods.push_back(method);
+                vTableMethodTys.push_back(method->getType());
+            }
+
+            vTableTy->setBody(vTableMethodTys);
+
+            auto vTableValue = llvm::ConstantStruct::get(vTableTy, vTableMethods);
+            createGlobalVar(vTableName, vTableValue);
         }
 
         /**
@@ -589,6 +738,11 @@ class EvaLLVM {
          * Is: (prop ...)
         */
         bool isProp(const Exp& exp) { return isTaggedList(exp, "prop"); }
+
+        /**
+         * Is: (super ...)
+        */
+        bool isSuper(const Exp& exp) { return isTaggedList(exp, "super"); }
 
         /**
          * Returns a class type by name
