@@ -66,7 +66,7 @@ class EvaLLVM {
     
     void exec(const std::string& program) {
         // 1. Parse the program
-        auto ast = parser->parse("(begin" + program + ")");
+        auto ast = parser->parse("(begin " + program + ")");
 
         // 2. Compile to LLVM IR
         compile(ast);
@@ -468,11 +468,28 @@ class EvaLLVM {
                         else {
                             auto callable = gen(expr.list[0], env);
 
-                            auto fn = (llvm::Function*)callable;
+                            // Either a raw function or a functor (callable class):
+                            auto callableTy = callable->getType()->getContainedType(0);   
 
                             std::vector<llvm::Value*> args{};
-
                             auto argIdx = 0;
+
+                            // Callable classes:
+                            if (callableTy->isStructTy()) {
+                                auto cls = (llvm::StructType*)callableTy;
+
+                                std::string className{cls->getName().data()};
+
+                                // Push the factor itself as the first `self` arg:
+                                args.push_back(callable);
+                                argIdx++;  // and skip this argument
+
+                                // TODO: support inheritance (load method from vTable)
+                                callable = module->getFunction(className + "___call__");  // Note 3 underscores
+                            }
+
+                            auto fn = (llvm::Function*)callable;
+
                             for (auto i = 1; i < expr.list.size(); i++, argIdx++) {
                                 auto argValue = gen(expr.list[i], env);
 

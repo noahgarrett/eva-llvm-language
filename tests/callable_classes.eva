@@ -1,0 +1,32 @@
+        // Functors - callable objects (aka Closures)
+
+        (class Transformer null
+            (begin
+            
+                (var factor 0)
+
+                (def constructor (self factor) -> Transformer
+                    (begin
+                    
+                        (set (prop self factor) factor)
+                        self
+                    )
+                )
+
+                (def __call__ (self v)
+                    (* (prop self factor) v)
+                )
+        
+            )
+        )
+
+        (var transform (new Transformer 5))
+
+        (printf "(transform 10) = %d\n" (transform 10)) // 50
+        (printf "(transform 10) = %d\n" ((method transform __call__) transform 10)) // 50
+
+        (def map (x (modify Transformer))
+            (modify x)
+        )
+
+        (printf "(map 10 transform) = %d\n" (map 10 transform)) // 50

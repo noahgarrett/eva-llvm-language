@@ -1,67 +1,61 @@
 #include <string>
 #include <iostream>
+#include <fstream>
 
 #include "./src/EvaLLVM.h"
 
+void printHelp() {
+    std::cout << "\nUsage: eva-llvm [options]\n\n"
+              << "Options:\n"
+              << "  -e, --expression    Expression to parse\n"
+              << "  -f, --file          File to parse\n\n";
+}
+
 int main(int argc, char const *argv[])
 {
-    // Program to execute
-    std::string program = R"(
-        (class Point null
-            (begin
-                
-                (var x 0)
-                (var y 0)
+    if (argc != 3) {
+        printHelp();
+        return 0;
+    }
 
-                (def constructor (self x y)
-                    (begin
-                        (set (prop self x) x)
-                        (set (prop self y) y)
-                    ))
+    /**
+     * Expression Mode
+    */
+    std::string mode = argv[1];
 
-                (def calc (self)
-                    (+ (prop self x) (prop self y))
-                    )
-                ))
+    /**
+     * Program to execute
+    */
+    std::string program;
 
-        (class Point3D Point
-            (begin
-            
-                (var z 100)
+    /**
+     * Simple expression
+    */
+    if (mode == "-e") {
+        program = argv[2];
+    }
 
-                (def constructor (self x y z)
-                    (begin
-                        ((method (super Point3D) constructor) self x y)
-                        (set (prop self z) z)
-                    )
-                )
+    /**
+     * Eva File
+    */
+    else if (mode == "-f") {
+        // Read the file
+        std::ifstream programFile(argv[2]);
+        std::stringstream buffer;
+        buffer << programFile.rdbuf() << "\n";
 
-                (def calc (self)
-                    (+ ((method (super Point3D) calc) self) (prop self z))
-                )
-            
-            ))
+        // Program:
+        program = buffer.str();
+    }
 
-        (var p1 (new Point 10 20))
-        (var p2 (new Point3D 100 200 300))
-
-        (printf "p2.x = %d\n" (prop p2 x))
-        (printf "p2.y = %d\n" (prop p2 y))
-        (printf "p2.z = %d\n" (prop p2 z))
-
-        (printf "Point3D.calc result = %d\n" ((method p2 calc) p2))
-
-        (def check ((obj Point))
-            (begin
-                ((method obj calc) obj)
-            )
-        )
-
-        (check p1) // Point.calc
-        (check p2) // Point3D.calc
-    )";
-
+    /**
+     * Compiler Instance
+    */
     EvaLLVM vm;
+
+    /**
+     * Generate LLVM IR
+    */
     vm.exec(program);
     printf("\n");
 
